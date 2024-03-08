@@ -10,6 +10,7 @@ from skimage import io
 from pystackreg import StackReg
 from basicpy import BaSiC
 import jax
+import cv2
 
 jax.config.update("jax_platform_name", "cpu")
 
@@ -17,12 +18,7 @@ import time
 from .flat_estimate import FlatEstimate
 from .naive_estimate import NaiveEstimate
 from .bagging import Bagging
-from .utils import (
-    reverse_with_flat_bg,
-    grid_noise_filter,
-    cross_signal_filter,
-    cut_light,
-)
+from .utils import *
 
 
 class StitchTool:
@@ -37,17 +33,18 @@ class StitchTool:
         self.flat_info = flat_info
 
     def correct(self, src, bias=0):
-        start_time = time.time()
         if "estimate" in self.flat_info:
             flat, bg = self.flat_estimate(src, bias)
         elif "NaiveEstimate" in self.flat_info:
             src = cut_light(src, min_num=0.5, max_num=95)
             src = grid_noise_filter(src)
             # src = cross_signal_filter(src, size=5)
+            start_time = time.time()
             flat, bg = self.naive_estimate(src, bias)
         elif "BaSic" in self.flat_info:
             src = cut_light(src, max_num=95)
             src = grid_noise_filter(src)
+            start_time = time.time()
             basic = BaSiC(get_darkfield=True, smoothness_flatfield=1)
             basic.fit(src)
             flat, bg = basic.flatfield, basic.darkfield
@@ -60,14 +57,24 @@ class StitchTool:
             flat = io.imread(self.flat_info["flat"])
             bg = io.imread(self.flat_info["bg"])
 
+        end_time = time.time()
+        save_folder = r"D:\MyCode\Light Field Correction\DisplayData\correction"
+        cv2.imwritemulti(path.join(save_folder, "origin.tif"), src)
+
         src = reverse_with_flat_bg(src, flat, bg)
         src = src.astype(np.uint16)
 
-        end_time = time.time()
+        name = "BaSiC" if "BaSic" in self.flat_info else "NaiveEstimate"
+        flat_name = "BaSiC" if "BaSic" in self.flat_info else "Naive"
+        # if name == "NaiveEstimate":
+        cv2.imwrite(path.join(save_folder, flat_name + "flat.tif"), flat)
+        cv2.imwrite(path.join(save_folder, name + "bg.tif"), bg)
+        cv2.imwritemulti(path.join(save_folder, name + "corrected.tif"), src)
+
         print("---- Correct time: {:.2f}s".format(end_time - start_time))
         return src
 
-    def average_img(self, images, average_num, is_registration=False):
+    def average_img(self, images, average_num, is_registration=False, over_exposure_detect = False):
         img_avg = np.zeros(
             (images.shape[0] // average_num, images.shape[1], images.shape[2]),
             dtype=np.uint16,
@@ -79,7 +86,31 @@ class StitchTool:
                     img_stack, axis=0, reference="previous"
                 )  # 输出的是形变矩阵
                 img_stack = self.sr.transform_stack(img_stack)
-            img_avg[i] = np.mean(img_stack, axis=0)
+
+            if over_exposure_detect:
+                # 判断是否过曝，为1表示不过曝，为0表示过曝
+                over_expose = np.ones(average_num,dtype=int)
+                over_expose_exist = 1
+                for j in range(average_num):
+                    img_current = img_stack[j]
+                    if np.std(img_current[:20,:]) < 150: over_expose[j] = 0
+                    if np.std(img_current[-20:,:]) < 150: over_expose[j] = 0
+                    if over_expose[j] == 0:
+                        print("Over-exposure detected: Image {}".format(i*average_num+j+2))
+                        over_expose_exist = 0
+
+                # 如果只有某几张过曝：去除过曝帧，保留剩余帧的平均值
+                if over_expose_exist == 0:
+                    img_stack_expose = img_stack[over_expose]
+                    if img_stack_expose.size > 0:
+                        img_avg[i] = np.mean(img_stack_expose,axis=0)
+                # 如果全部过曝或不过曝：取所有图像的平均
+                    else:
+                        img_avg[i] = np.mean(img_stack, axis=0)
+                else:
+                    img_avg[i] = np.mean(img_stack, axis=0)
+            else:
+                img_avg[i] = np.mean(img_stack, axis=0)
         return img_avg
 
     def stitch(
@@ -114,63 +145,26 @@ class StitchTool:
                 new_img[-images.shape[0] :] = images
 
             images = new_img
-        images = self.average_img(images, average_num, is_registration)
-        images = self.correct(images, bias)
 
-        images = images.astype(np.uint16)
-        rows, cols = [], []
-        for row in range(row_num):
-            rows += [row] * col_num
-            if row % 2 == 0:
-                cols += list(range(col_num))
-            else:
-                cols += list(range(col_num - 1, -1, -1))
 
-        zzz = images
-        output = np.zeros(
-            (zzz.shape[1] * row_num, zzz.shape[2] * col_num), dtype=images.dtype
-        )
+        images_avg = self.average_img(images, average_num, is_registration)
+        images_avg = self.correct(images_avg, bias)
 
-        h, w = images.shape[1], images.shape[2]
-        hide = int(overlay * images.shape[1])
-        # print('重叠量：',overlay)
-        step = zzz.shape[1] - hide
-
-        overlay_map = np.zeros_like(output, dtype=np.uint8)
-
-        for i in range(zzz.shape[0]):
-            row, col = rows[i], cols[i]
-            x0, x1 = step * col, step * col + w
-            y0, y1 = step * row, step * row + h
-
-            image = zzz[i, :, :]
-            patch = output[y0:y1, x0:x1]
-            overlay_patch = overlay_map[y0:y1, x0:x1]
-
-            if overlay_patch.sum() != 0:
-                weight_overlay = ndimage.morphology.distance_transform_edt(
-                    overlay_patch
-                ).astype(np.float64)
-                max_value = np.partition(weight_overlay.flatten(), -2)[-2]
-                weight_overlay /= max_value
-                weight_overlay = np.clip(weight_overlay, 0, 1)
-            else:
-                weight_overlay = np.zeros_like(patch, dtype=np.float64)
-
-            weight_no_overlay = (
-                np.ones_like(weight_overlay, dtype=np.float64) - weight_overlay
-            )
-            patch = patch * weight_overlay + image * weight_no_overlay
-
-            overlay_map[y0:y1, x0:x1] = 1
-            output[
-                y0:y1, x0:x1
-            ] = patch  # patch是float型而output是整型。请确保灰度级够大（不够大就乘个系数），否则这零点几的精度损失会带来明显的视觉差异
-
+        output = merge_images(images_avg, row_num, col_num)
         # 后处理中值滤波，能够去串扰
         output = median_filter(output, size=3)
         print(">>>>  finish", save_path)
         io.imsave(save_path, output)
+
+        # 额外计算一个去除过曝的图片
+        images_overexposure_detected = self.average_img(images, average_num, is_registration,over_exposure_detect=True)
+        images_overexposure_detected = self.correct(images_overexposure_detected,bias)
+        output_overexposure_detected = merge_images(images_overexposure_detected, row_num, col_num)
+        output_overexposure_detected = median_filter(output_overexposure_detected, size=3)
+        save_path_2 = save_path.split(".")[0] + "_2.tif"
+
+        print(">>>>  finish", save_path_2)
+        io.imsave(save_path_2, output_overexposure_detected)
         return output
 
 
